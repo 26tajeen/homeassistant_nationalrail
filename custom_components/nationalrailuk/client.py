@@ -23,7 +23,7 @@ class NationalRailClientInvalidToken(NationalRailClientException):
 
 
 class NationalRailClientInvalidInput(NationalRailClientException):
-    """Token is Invalid"""
+    """Invalid input parameters such as station codes"""
 
 
 def rebuild_date(base, time):
