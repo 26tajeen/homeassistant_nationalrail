@@ -23,7 +23,7 @@ class NationalRailClientInvalidToken(NationalRailClientException):
 
 
 class NationalRailClientInvalidInput(NationalRailClientException):
-    """Token is Invalid"""
+    """Invalid input parameters such as station codes"""
 
 
 def rebuild_date(base, time):
@@ -53,27 +53,15 @@ class NationalRailClient:
     """Client for the National Rail API"""
 
     def __init__(self, api_token, station, destinations) -> None:
+        """Initialize the client."""
         self.station = station
         self.api_token = api_token
         self.destinations = destinations if destinations is not None else []
-
-        settings = Settings(strict=False)
-
-        history = HistoryPlugin()
-
-        wsdl_client = httpx.Client(
-            verify=True,
-            timeout=300,
-        )
-        httpx_client = httpx.AsyncClient(verify=True, timeout=300)
-        transport = AsyncTransport(client=httpx_client, wsdl_client=wsdl_client)
-
-        self.client = AsyncClient(
-            wsdl=WSDL, transport=transport, settings=settings, plugins=[history]
-        )
-
-        # Prepackage the authorisation token
-        header = xsd.Element(
+        self.client = None
+        self.header_value = None
+        
+        # Prepackage the authorization token structure (but don't set the value yet)
+        self.header = xsd.Element(
             "{http://thalesgroup.com/RTTI/2013-11-28/Token/types}AccessToken",
             xsd.ComplexType(
                 [
@@ -84,10 +72,44 @@ class NationalRailClient:
                 ]
             ),
         )
-        self.header_value = header(TokenValue=self.api_token)
+
+    async def setup_client(self):
+        """Set up the SOAP client asynchronously."""
+        if self.client is not None:
+            return
+            
+        import asyncio
+        
+        settings = Settings(strict=False)
+        history = HistoryPlugin()
+        
+        # Create the transport in the executor to avoid blocking
+        def create_transport():
+            wsdl_client = httpx.Client(verify=True, timeout=300)
+            httpx_client = httpx.AsyncClient(verify=True, timeout=300)
+            return AsyncTransport(client=httpx_client, wsdl_client=wsdl_client)
+        
+        # Run the blocking operation in a thread
+        transport = await asyncio.to_thread(create_transport)
+        
+        # Create the client
+        self.client = AsyncClient(
+            wsdl=WSDL, 
+            transport=transport, 
+            settings=settings, 
+            plugins=[history]
+        )
+        
+        # Set the header value
+        self.header_value = self.header(TokenValue=self.api_token)        
 
     async def get_raw_departures(self):
-        """Get the raw data from the api"""
+        """Get the raw data from the api."""
+        # Ensure client is set up
+        if self.client is None:
+            await self.setup_client()
+            
+        # Rest of the method remains the same
         if len(self.destinations) == 0:
             res = await self.client.service.GetDepBoardWithDetails(
                 numRows=10, crs=self.station, _soapheaders=[self.header_value]
@@ -216,7 +238,11 @@ class NationalRailClient:
         return status
 
     async def async_get_data(self):
-        """Data resfresh function called by the coordinator"""
+        """Data refresh function called by the coordinator"""
+        # Ensure client is set up
+        if self.client is None:
+            await self.setup_client()
+            
         try:
             _LOGGER.info("Requesting depearture data for %s", self.station)
             raw_data = await self.get_raw_departures()
