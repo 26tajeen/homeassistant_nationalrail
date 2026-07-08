@@ -19,6 +19,7 @@ from .const import (
     CONF_DESTINATIONS,
     CONF_STATION,
     CONF_TOKEN,
+    CONF_RTT_TOKEN,
     DOMAIN,
     CONF_MONITOR_TRAIN,
     CONF_TARGET_TIME,
@@ -139,6 +140,21 @@ async def get_global_api_token(hass):
         return token
 
     _LOGGER.debug("No token found in any location")
+    return None
+
+
+def get_global_rtt_token(hass):
+    """Get the RealTimeTrains (data.rtt.io) refresh token from any entry.
+
+    The token is global to the integration; it can be set via the options flow
+    on any entry, so return the first non-empty value found.
+    """
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        value = (entry.options or {}).get(CONF_RTT_TOKEN) or (entry.data or {}).get(
+            CONF_RTT_TOKEN
+        )
+        if value:
+            return value
     return None
 
 # --- Helper function (ensure_global_token_entry) remains the same ---
@@ -595,6 +611,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     selector.NumberSelectorConfig(min=5, max=60, step=5, unit_of_measurement="minutes")
                 ),
                 vol.Optional(CONF_MONITORED_TRAIN_NAME, default=self._entry_data.get(CONF_MONITORED_TRAIN_NAME, "")): cv.string,
+                vol.Optional(CONF_RTT_TOKEN, default=self._entry_data.get(CONF_RTT_TOKEN, "")): cv.string,
                 # Add destinations here too? Or assume they are only for non-monitored?
                 # If monitored trains *also* use the destination filter for the source sensor, include it.
                 # Let's assume destinations are primarily for the general schedule sensor for now.
@@ -615,6 +632,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         # custom_value=True # Allows typing CRS codes not in the list
                     )
                 ),
+                vol.Optional(CONF_RTT_TOKEN, default=self._entry_data.get(CONF_RTT_TOKEN, "")): cv.string,
             }
 
         return self.async_show_form(

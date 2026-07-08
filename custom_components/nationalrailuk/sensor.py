@@ -39,8 +39,8 @@ from .const import (
 )
 from .stations import STATION_MAP
 
-# Import RealTimeTrains UID resolver
-from .rtt_resolver import get_rtt_uid
+# RealTimeTrains (data.rtt.io) API client for live in-journey tracking
+from .rtt_client import RTTClient
 
 _LOGGER = logging.getLogger(__name__)
 # <<< CHANGE 1: Update Version >>>
@@ -1169,35 +1169,69 @@ class MonitoredTrainSensor(SensorEntity):
 
     async def _async_fetch_rtt_position(
         self,
-        rtt_uid: str,
+        rtt_ref: str,
         update_time: datetime
     ) -> dict | None:
-        """Fetch RTT position data for en-route tracking.
+        """Fetch live position for the tracked train from the RTT (data.rtt.io) API.
 
-        Returns:
-            RTT position dict on success, None on failure.
+        ``rtt_ref`` is an "identity:departureDate" reference produced by
+        RTTClient.resolve_identity. Returns a position dict compatible with the
+        en-route consumer, or None on failure.
         """
         entity_id_log = self.entity_id or self._attr_name
 
         try:
-            from .rtt_scraper import RTTScraper
+            from .config_flow import get_global_rtt_token
 
-            scraper = RTTScraper()
-            date = update_time.strftime("%Y-%m-%d")
-            rtt_position = await scraper.get_train_position(rtt_uid, date)
+            token = get_global_rtt_token(self.hass)
+            if not token:
+                _LOGGER.debug("%s: No RTT refresh token configured; skipping RTT.", entity_id_log)
+                return None
 
-            if rtt_position:
-                _LOGGER.debug(
-                    "%s: RTT position fetched: %s -> %s",
-                    entity_id_log,
-                    rtt_position.get("last_station"),
-                    rtt_position.get("next_station"),
-                )
-            else:
-                _LOGGER.debug("%s: RTT returned no position for UID %s", entity_id_log, rtt_uid)
+            identity, _, date = (rtt_ref or "").partition(":")
+            if not identity:
+                return None
+            if not date:
+                date = update_time.strftime("%Y-%m-%d")
+
+            service = await RTTClient(token).get_service(identity, date)
+            if not service:
+                _LOGGER.debug("%s: RTT returned no service for %s", entity_id_log, rtt_ref)
+                return None
+
+            position = service.get("position") or {}
+            calling = service.get("calling_points") or []
+
+            # Has the train reached the *user's* destination (which may be an
+            # intermediate stop, not the train's terminus)? True once that
+            # calling point has an actual time.
+            dest_name = STATION_MAP.get(self._destination_crs, self._destination_crs)
+            arrived_at_dest = False
+            if dest_name:
+                for cp in calling:
+                    if cp.get("name") and cp["name"].upper() == dest_name.upper():
+                        arrived_at_dest = bool(cp.get("actual"))
+                        break
+
+            forecast = position.get("next_stop_forecast")
+            lateness = service.get("lateness")
+            rtt_position = {
+                "last_station": position.get("last_reported"),
+                # Only consumed by the caller to detect arrival at the destination.
+                "last_station_crs": self._destination_crs if arrived_at_dest else None,
+                "next_station": None if arrived_at_dest else position.get("next_stop"),
+                "next_station_time": forecast[11:16] if forecast else None,
+                "is_delayed": bool(lateness and lateness > 0),
+                "lateness": lateness,
+            }
+            _LOGGER.debug(
+                "%s: RTT position: last=%s next=%s late=%s arrived_dest=%s",
+                entity_id_log, rtt_position["last_station"],
+                rtt_position["next_station"], lateness, arrived_at_dest,
+            )
             return rtt_position
         except Exception as err:
-            _LOGGER.debug("%s: RTT position fetch failed for %s: %s", entity_id_log, rtt_uid, err)
+            _LOGGER.debug("%s: RTT position fetch failed for %s: %s", entity_id_log, rtt_ref, err)
             return None
 
     async def _async_fetch_arrival_data(self) -> dict | None:
@@ -2061,8 +2095,9 @@ class MonitoredTrainSensor(SensorEntity):
                         # Fetch RealTimeTrains UID for this train
                         if self._tracked_scheduled_departure_dt:
                             try:
-                                from .rtt_resolver import get_rtt_uid
+                                from .config_flow import get_global_rtt_token
                                 operator_code = initial_best_train.get('operator_code')
+                                rtt_token = get_global_rtt_token(self.hass)
 
                                 # For RTT matching, use the train's actual terminus, not the user's target destination
                                 # because RTT displays the final terminus, not intermediate calling points
@@ -2097,16 +2132,19 @@ class MonitoredTrainSensor(SensorEntity):
                                             self._tracked_scheduled_departure_dt.strftime('%H:%M'),
                                             operator_code or "unknown", terminus)
 
-                                self._tracked_uid = await get_rtt_uid(
-                                    self._origin_crs,
-                                    rtt_destination_crs,
-                                    self._tracked_scheduled_departure_dt,
-                                    operator_code
-                                )
-                                if self._tracked_uid:
-                                    _LOGGER.info("%s: Resolved RTT UID: %s", entity_id_log, self._tracked_uid)
+                                if rtt_token:
+                                    self._tracked_uid = await RTTClient(rtt_token).resolve_identity(
+                                        self._origin_crs,
+                                        rtt_destination_crs,
+                                        self._tracked_scheduled_departure_dt,
+                                    )
                                 else:
-                                    _LOGGER.warning("%s: Could not resolve RTT UID", entity_id_log)
+                                    self._tracked_uid = None
+                                    _LOGGER.debug("%s: No RTT token; skipping RTT resolution", entity_id_log)
+                                if self._tracked_uid:
+                                    _LOGGER.info("%s: Resolved RTT reference: %s", entity_id_log, self._tracked_uid)
+                                else:
+                                    _LOGGER.warning("%s: Could not resolve RTT reference", entity_id_log)
                             except Exception as err:
                                 _LOGGER.error("%s: Error fetching RTT UID: %s", entity_id_log, err, exc_info=True)
                                 self._tracked_uid = None

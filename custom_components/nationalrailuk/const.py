@@ -14,6 +14,9 @@ CONF_TOKEN = "api_token"
 CONF_STATION = "station"
 CONF_DESTINATIONS = "destinations"
 
+# RealTimeTrains (data.rtt.io) refresh token, used for live in-journey tracking
+CONF_RTT_TOKEN = "rtt_refresh_token"
+
 # New configuration keys for specific train monitoring
 CONF_MONITOR_TRAIN = "monitor_train"
 CONF_TARGET_TIME = "target_time"
