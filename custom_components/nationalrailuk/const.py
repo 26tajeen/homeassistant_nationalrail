@@ -25,14 +25,18 @@ CONF_MONITORED_TRAIN_NAME = "monitored_train_name"
 # Default values
 DEFAULT_TIME_WINDOW = 30
 
-# Refresh frequency for the sensor
-REFRESH = 1
+# Refresh frequency for the sensor (in minutes)
+# This controls how often the coordinator fetches new data from the API
+REFRESH = 10
 
-# Polling interval (in minutes)
+# Polling interval (in minutes) - kept for backwards compatibility
 POLLING_INTERVALE = 10
 
-# Increase polling frequency if withing X minutes of next departure or if train is late
-HIGH_FREQUENCY_REFRESH = 7
+# Increase polling frequency if within X minutes of next departure or if train is late
+HIGH_FREQUENCY_REFRESH = 10  # Trigger high-frequency mode when train is within 10 minutes
+
+# High-frequency polling interval (in minutes) - how often to poll when train is imminent
+HIGH_FREQUENCY_INTERVAL = 1  # Poll every 1 minute when train is within 10 minutes
 
 
 ATTR_ENTITY_ID = "entity_id"

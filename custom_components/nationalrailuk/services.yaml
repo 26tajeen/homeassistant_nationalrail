@@ -1,0 +1,78 @@
+create_temporary_sensor:
+  name: Create temporary train sensor
+  description: Create a temporary sensor to monitor a specific train journey
+  fields:
+    station:
+      name: Station code
+      description: Three-letter station code (e.g., "YRK" for York, "KGX" for Kings Cross)
+      required: true
+      example: "YRK"
+      selector:
+        text:
+    destination:
+      name: Destination code
+      description: Three-letter destination station code
+      required: true
+      example: "LDS"
+      selector:
+        text:
+    time:
+      name: Departure time
+      description: Target departure time in HH:MM format
+      required: true
+      example: "14:30"
+      selector:
+        text:
+    duration_minutes:
+      name: Duration
+      description: How long to monitor this train (in minutes)
+      required: false
+      default: 120
+      example: 120
+      selector:
+        number:
+          min: 15
+          max: 480
+          unit_of_measurement: minutes
+    time_window_minutes:
+      name: Time window
+      description: Look for trains within this many minutes of target time
+      required: false
+      default: 30
+      example: 30
+      selector:
+        number:
+          min: 5
+          max: 120
+          unit_of_measurement: minutes
+    sensor_id:
+      name: Sensor ID
+      description: Optional custom sensor ID (will be prefixed with 'temp_')
+      required: false
+      example: "my_train"
+      selector:
+        text:
+  response:
+    variable:
+      name: Sensor created
+      description: Information about the created temporary sensor
+
+delete_temporary_sensor:
+  name: Delete temporary train sensor
+  description: Delete a temporary train monitoring sensor
+  fields:
+    sensor_id:
+      name: Sensor ID
+      description: The ID of the temporary sensor to delete
+      required: true
+      example: "temp_yrk_lds_a1b2c3d4"
+      selector:
+        text:
+
+list_temporary_sensors:
+  name: List temporary sensors
+  description: List all active temporary train monitoring sensors
+  response:
+    variable:
+      name: Active sensors
+      description: List of all active temporary train sensors

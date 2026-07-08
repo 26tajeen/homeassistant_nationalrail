@@ -34,7 +34,27 @@ def rebuild_date(base, time):
     Returns datetime object or None if parsing fails.
     """
     if isinstance(time, datetime): return time # Already datetime
-    if not isinstance(time, str) or not time or ":" not in time:
+    if not isinstance(time, str) or not time:
+        _LOGGER.debug("Invalid time format for rebuild_date: %s (%s)", time, type(time).__name__)
+        return None
+
+    # Check for known status strings - these are expected and should not log debug messages
+    known_status_strings = ["on time", "delayed", "cancelled", "no report", "bus", "ferry"]
+    if time.lower() in known_status_strings:
+        return None  # Return None silently for expected status strings
+
+    # Check if it's a time string (contains colon)
+    if ":" not in time:
+        _LOGGER.debug("Invalid time format for rebuild_date: %s (%s)", time, type(time).__name__)
+        return None
+
+    # Check for known status strings - these are expected and should not log debug messages
+    known_status_strings = ["on time", "delayed", "cancelled", "no report", "bus", "ferry"]
+    if time.lower() in known_status_strings:
+        return None  # Return None silently for expected status strings
+
+    # Check if it's a time string (contains colon)
+    if ":" not in time:
         _LOGGER.debug("Invalid time format for rebuild_date: %s (%s)", time, type(time).__name__)
         return None
 
@@ -139,8 +159,31 @@ class NationalRailClient:
 
                 # Ensure trainServices.service exists and is a list
                 if not hasattr(combined_res, 'trainServices') or combined_res.trainServices is None:
-                    combined_res.trainServices = self.client.get_type('ns0:ArrayOfServiceItemsWithCallingPoints')() # Create appropriate type
+                    _LOGGER.debug("Response for first destination %s lacked trainServices. Creating structure.", first_dest)
+                    try:
+                        # --- MODIFIED LINE ---
+                        # Define the correct namespace URI for LDB types
+                        ldb_types_namespace = 'http://thalesgroup.com/RTTI/2017-10-01/ldb/types' # Or check your specific WSDL version if different
+                        service_array_type_qname = f"{{{ldb_types_namespace}}}ArrayOfServiceItemsWithCallingPoints"
+                        _LOGGER.debug("Attempting to get type: %s", service_array_type_qname)
+                        # Get the type constructor using the fully qualified name
+                        ServiceArrayType = self.client.get_type(service_array_type_qname)
+                        # Create an instance of that type
+                        combined_res.trainServices = ServiceArrayType()
+                        _LOGGER.debug("Successfully created empty trainServices structure.")
+                        # --- END MODIFIED BLOCK ---
+                    except exceptions.LookupError as lookup_err:
+                        _LOGGER.error("Failed to find type '%s'. This might indicate a WSDL parsing issue or incorrect namespace. Zeep Error: %s", service_array_type_qname, lookup_err)
+                        # Raise a more specific error or handle gracefully
+                        raise NationalRailClientException(f"Internal error: Could not create required type '{service_array_type_qname}'") from lookup_err
+                    except Exception as e:
+                         _LOGGER.exception("Unexpected error creating trainServices structure.")
+                         raise NationalRailClientException("Internal error: Failed to initialize train service structure") from e
+
+
+                # Initialize the 'service' list within trainServices if it doesn't exist
                 if not hasattr(combined_res.trainServices, 'service') or combined_res.trainServices.service is None:
+                     _LOGGER.debug("trainServices structure exists but lacks 'service' list. Initializing.")
                      combined_res.trainServices.service = [] # Initialize as empty list
 
                 # Fetch remaining batches
@@ -202,6 +245,68 @@ class NationalRailClient:
         _LOGGER.debug("GetDepBoardWithDetails call successful for %s.", self.station)
         return res
 
+    async def get_raw_arrivals(self, destination_crs: str, origin_crs: str = None):
+        """Get arrival board data using GetArrBoardWithDetails.
+
+        Args:
+            destination_crs: The destination station CRS code
+            origin_crs: Optional origin station to filter arrivals (filterType="from")
+
+        Returns:
+            Arrival board data or None if failed
+        """
+        if self.client is None:
+            await self.setup_client()
+
+        _LOGGER.debug(
+            "Fetching arrivals for %s using GetArrBoardWithDetails. Origin filter: %s",
+            destination_crs,
+            origin_crs or "None"
+        )
+
+        res = None
+        try:
+            if not origin_crs:
+                # No origin filter - get all arrivals
+                _LOGGER.debug("No origin filter specified for arrivals at %s.", destination_crs)
+                res = await self.client.service.GetArrBoardWithDetails(
+                    numRows=15,
+                    crs=destination_crs,
+                    _soapheaders=[self.header_value]
+                )
+            else:
+                # Filter by origin station
+                _LOGGER.debug(
+                    "Fetching arrivals at %s from %s.",
+                    destination_crs,
+                    origin_crs
+                )
+                res = await self.client.service.GetArrBoardWithDetails(
+                    numRows=15,
+                    crs=destination_crs,
+                    filterCrs=origin_crs,
+                    filterType="from",
+                    _soapheaders=[self.header_value]
+                )
+
+        except Fault as err:
+            _LOGGER.error("SOAP Fault during GetArrBoardWithDetails: %s", err.message)
+            raise err
+        except Exception as e:
+            _LOGGER.error("Error during GetArrBoardWithDetails call: %s", e, exc_info=True)
+            raise NationalRailClientException("Error calling GetArrBoardWithDetails") from e
+
+        # Validation
+        if not res or not hasattr(res, 'locationName'):
+            _LOGGER.warning(
+                "GetArrBoardWithDetails response seems invalid or empty. Object type: %s",
+                type(res).__name__
+            )
+            return None
+
+        _LOGGER.debug("GetArrBoardWithDetails call successful for %s.", destination_crs)
+        return res
+
     def process_data(self, station_board):
         """
         Unpack the data return by the api (expects Zeep object like StationBoardWithDetails).
@@ -249,7 +354,7 @@ class NationalRailClient:
                 services_list = [services_list]
 
         if not services_list:
-             _LOGGER.info("No train services found or service list empty for %s.", status["station"])
+             _LOGGER.debug("No train services found or service list empty for %s.", status["station"])
              return status # Return status with potentially NRCC messages but no trains
 
         processed_serviceIDs = set()
@@ -259,26 +364,58 @@ class NationalRailClient:
 
             # --- Basic Service Info & Duplicate Check ---
             service_id = getattr(service, 'serviceID', None)
+
+            # DEBUG: Log service ID fields and check for base64-like values
+            _LOGGER.debug("Service '%s' - serviceID='%s', rsid='%s'",
+                         service_id or 'UNKNOWN',
+                         service_id,
+                         getattr(service, 'rsid', None))
+
+            # Check all attributes for anything that looks like base64
+            for attr in dir(service):
+                if not attr.startswith('_'):
+                    val = getattr(service, attr, None)
+                    if isinstance(val, str) and len(val) > 10 and ('=' in val or (val.replace('+', '').replace('/', '').isalnum())):
+                        _LOGGER.debug("  Potential base64 field '%s': '%s'", attr, val)
+
             if not service_id or service_id in processed_serviceIDs: continue
             processed_serviceIDs.add(service_id)
 
             # --- Departure Times ---
             std_str = getattr(service, 'std', None)
-            scheduled_time = rebuild_date(time_base, std_str)
-            if scheduled_time is None: continue
+            scheduled_time = rebuild_date(time_base, std_str) # Assumes std is always HH:MM or parsable
+            if scheduled_time is None:
+                _LOGGER.warning("Skipping service %s due to unparsable scheduled time: %s", service_id, std_str)
+                continue
 
-            etd_str = getattr(service, 'etd', 'On time')
-            expected_time_value = None
-            expected_time_status = None
-            parsed_etd_dt = rebuild_date(time_base, etd_str)
+            etd_str = getattr(service, 'etd', 'On time') # Raw string: "10:05", "On time", "Delayed"
+            expected_time_value = None  # Will hold a datetime if ETD is a time
+            expected_time_status = None # Will hold "On time", "Delayed", etc.
 
-            if isinstance(parsed_etd_dt, datetime):
-                 expected_time_value = parsed_etd_dt
-            elif isinstance(parsed_etd_dt, str):
-                 expected_time_status = parsed_etd_dt
-                 if expected_time_status == "On time": expected_time_value = scheduled_time
-            else:
-                 expected_time_value = scheduled_time
+            known_status_strings = ["on time", "delayed", "cancelled", "no report", "bus", "ferry"] # Add more as needed
+
+            if isinstance(etd_str, str) and etd_str.lower() in known_status_strings:
+                expected_time_status = etd_str # Use the original string as status
+                if etd_str.lower() == "on time":
+                    expected_time_value = scheduled_time
+                elif etd_str.lower() == "delayed":
+                    # For "Delayed", actual time is unknown, use scheduled for sorting, status is "Delayed"
+                    expected_time_value = scheduled_time
+                # For "Cancelled", is_cancelled_bool primarily handles it. expected_time_value can remain None.
+                # For other statuses like "No Report", "Bus", "Ferry", expected_time_value might be None or fallback to scheduled_time
+                # The original logic for a failed rebuild_date was to set expected_time_value = scheduled_time
+                elif etd_str.lower() not in ["cancelled"]: # Avoid overriding if it's "cancelled" and we want None time
+                     expected_time_value = scheduled_time
+
+            else: # etd_str is not a known status string, try to parse as time
+                parsed_etd_dt = rebuild_date(time_base, etd_str) # rebuild_date will log DEBUG if it still fails
+                if isinstance(parsed_etd_dt, datetime):
+                    expected_time_value = parsed_etd_dt
+                else:
+                    # Parsing failed for an HH:MM-like string, or it was an unexpected string format
+                    _LOGGER.warning("etd_str '%s' was not a known status and failed time parsing by rebuild_date. ServiceID: %s", etd_str, service_id)
+                    expected_time_status = etd_str # Use the problematic string as status
+                    expected_time_value = scheduled_time # Fallback
 
             # --- Platform & Terminus ---
             platform = getattr(service, 'platform', None)
@@ -435,13 +572,262 @@ class NationalRailClient:
 
         return status
 
+    async def get_service_details(self, service_id: str):
+        """
+        Get detailed information about a specific service/train by its service ID.
+        This allows tracking a train throughout its entire journey.
+        """
+        if self.client is None:
+            await self.setup_client()
+
+        _LOGGER.debug("Fetching service details for service ID: %s (len=%d, type=%s, format=%s)",
+                     service_id, len(service_id) if service_id else 0,
+                     type(service_id).__name__,
+                     'base64' if ('=' in service_id if isinstance(service_id, str) else False) else 'UID')
+
+        try:
+            res = await self.client.service.GetServiceDetails(
+                serviceID=service_id,
+                _soapheaders=[self.header_value]
+            )
+
+            # Enhanced validation and logging
+            if not res:
+                _LOGGER.warning(
+                    "GetServiceDetails returned None/empty response for service %s. "
+                    "Service may have completed its journey or is no longer available in live data.",
+                    service_id
+                )
+                return None
+
+            if not hasattr(res, 'serviceType'):
+                _LOGGER.warning(
+                    "GetServiceDetails response for %s lacks 'serviceType' attribute. "
+                    "Response type: %s, attributes: %s. Service may no longer be tracked by the API.",
+                    service_id,
+                    type(res).__name__,
+                    [attr for attr in dir(res) if not attr.startswith('_')][:10]  # Log first 10 attrs
+                )
+                return None
+
+            _LOGGER.debug("GetServiceDetails call successful for service %s (serviceType: %s)",
+                         service_id, getattr(res, 'serviceType', 'unknown'))
+            return res
+
+        except Fault as err:
+            # Check for specific SOAP faults that indicate service not available
+            if "not found" in err.message.lower() or "invalid" in err.message.lower():
+                _LOGGER.warning(
+                    "SOAP Fault: Service %s not found in live data. "
+                    "Train may have completed journey or service ID expired. Fault: %s",
+                    service_id, err.message
+                )
+                return None  # Return None instead of raising, allow graceful handling
+            _LOGGER.error("SOAP Fault during GetServiceDetails for %s: %s", service_id, err.message)
+            raise err
+        except Exception as e:
+            _LOGGER.error("Error during GetServiceDetails call for %s: %s", service_id, e, exc_info=True)
+            raise NationalRailClientException("Error calling GetServiceDetails") from e
+
+    def process_arrival_data(self, arrival_board, target_arrival_time: datetime = None):
+        """
+        Process arrival board data to find trains arriving at the destination.
+        Simplified version focused on arrival tracking.
+
+        Args:
+            arrival_board: Zeep object from GetArrBoardWithDetails
+            target_arrival_time: Optional expected arrival time to help identify the train
+
+        Returns:
+            Dict with arrival info including trains list or None if no arrivals found
+        """
+        if not arrival_board:
+            return None
+
+        result = {}
+        time_base = getattr(arrival_board, 'generatedAt', datetime.now().astimezone())
+        result["station"] = getattr(arrival_board, 'locationName', "Unknown")
+        result["arrivals"] = []
+
+        # Get train services
+        train_services_container = getattr(arrival_board, 'trainServices', None)
+        services_list = []
+        if train_services_container:
+            services_list = getattr(train_services_container, 'service', [])
+            if services_list and not isinstance(services_list, list):
+                services_list = [services_list]
+
+        if not services_list:
+            _LOGGER.debug("No arrivals found at %s", result["station"])
+            return result
+
+        for service in services_list:
+            service_id = getattr(service, 'serviceID', None)
+            if not service_id:
+                continue
+
+            # Get arrival times (sta=scheduled time of arrival, eta=expected time of arrival)
+            sta_str = getattr(service, 'sta', None)
+            scheduled_arrival = rebuild_date(time_base, sta_str)
+            if not scheduled_arrival:
+                continue
+
+            eta_str = getattr(service, 'eta', 'On time')
+            expected_arrival_dt = rebuild_date(time_base, eta_str)
+            expected_arrival = expected_arrival_dt if expected_arrival_dt else eta_str
+
+            # Get origin info
+            origin_name = "Unknown"
+            origin_info = getattr(service, 'origin', None)
+            if origin_info:
+                location_list = getattr(origin_info, 'location', [])
+                if location_list and not isinstance(location_list, list):
+                    location_list = [location_list]
+                if location_list and hasattr(location_list[0], 'locationName'):
+                    origin_name = getattr(location_list[0], 'locationName', "Unknown")
+
+            # Get other info
+            platform = getattr(service, 'platform', None)
+            operator = getattr(service, 'operator', None)
+            is_cancelled = getattr(service, 'isCancelled', False) is True
+            delay_reason = getattr(service, 'delayReason', None)
+            cancel_reason = getattr(service, 'cancelReason', None)
+
+            arrival = {
+                "service_id": service_id,
+                "origin": origin_name,
+                "scheduled_arrival": scheduled_arrival,
+                "expected_arrival": expected_arrival,
+                "platform": platform,
+                "operator": operator,
+                "is_cancelled": is_cancelled,
+                "delay_reason": delay_reason,
+                "cancel_reason": cancel_reason,
+            }
+            result["arrivals"].append(arrival)
+
+        _LOGGER.debug("Processed %d arrivals at %s", len(result["arrivals"]), result["station"])
+        return result
+
+    def process_service_details(self, service_details):
+        """
+        Process the service details response to extract en-route tracking information.
+        Returns structured data about the train's journey including previous and subsequent stops.
+        """
+        if not service_details:
+            return None
+
+        status = {}
+        time_base = getattr(service_details, 'generatedAt', datetime.now().astimezone())
+
+        # Basic service info
+        status["service_id"] = getattr(service_details, 'serviceID', None)
+        status["operator"] = getattr(service_details, 'operator', None)
+        status["operator_code"] = getattr(service_details, 'operatorCode', None)
+        status["is_cancelled"] = getattr(service_details, 'isCancelled', False) is True
+        status["cancel_reason"] = getattr(service_details, 'cancelReason', None)
+        status["delay_reason"] = getattr(service_details, 'delayReason', None)
+
+        # NRCC Messages
+        raw_nrcc = getattr(service_details, 'nrccMessages', None)
+        if raw_nrcc:
+            messages_list = []
+            message_entries = getattr(raw_nrcc, 'message', [])
+            if message_entries and not isinstance(message_entries, list):
+                message_entries = [message_entries]
+            if message_entries:
+                for entry in message_entries:
+                    msg_text = None
+                    if isinstance(entry, str):
+                        msg_text = entry
+                    elif hasattr(entry, '_value_1'):
+                        msg_text = entry._value_1
+                    elif hasattr(entry, 'value'):
+                        msg_text = entry.value
+                    if isinstance(msg_text, str) and msg_text.strip():
+                        cleaned_msg = ' '.join(msg_text.strip().split())
+                        messages_list.append(cleaned_msg)
+            status["nrcc_messages"] = messages_list if messages_list else None
+        else:
+            status["nrcc_messages"] = None
+
+        # Previous calling points (where the train has been)
+        previous_points = []
+        previous_cp_container = getattr(service_details, 'previousCallingPoints', None)
+        if previous_cp_container:
+            cp_list_wrapper = getattr(previous_cp_container, 'callingPointList', [])
+            if cp_list_wrapper and not isinstance(cp_list_wrapper, list):
+                cp_list_wrapper = [cp_list_wrapper]
+            if cp_list_wrapper and hasattr(cp_list_wrapper[0], 'callingPoint'):
+                calling_points = getattr(cp_list_wrapper[0], 'callingPoint', [])
+                if calling_points and not isinstance(calling_points, list):
+                    calling_points = [calling_points]
+
+                for cp in calling_points:
+                    cp_data = {
+                        "name": getattr(cp, 'locationName', 'Unknown'),
+                        "crs": getattr(cp, 'crs', None),
+                        "scheduled_time": rebuild_date(time_base, getattr(cp, 'st', None)),
+                        "actual_time": rebuild_date(time_base, getattr(cp, 'at', None)),
+                    }
+                    previous_points.append(cp_data)
+
+        status["previous_stops"] = previous_points
+
+        # Subsequent calling points (where the train is going)
+        subsequent_points = []
+        subsequent_cp_container = getattr(service_details, 'subsequentCallingPoints', None)
+        if subsequent_cp_container:
+            cp_list_wrapper = getattr(subsequent_cp_container, 'callingPointList', [])
+            if cp_list_wrapper and not isinstance(cp_list_wrapper, list):
+                cp_list_wrapper = [cp_list_wrapper]
+            if cp_list_wrapper and hasattr(cp_list_wrapper[0], 'callingPoint'):
+                calling_points = getattr(cp_list_wrapper[0], 'callingPoint', [])
+                if calling_points and not isinstance(calling_points, list):
+                    calling_points = [calling_points]
+
+                for cp in calling_points:
+                    et_str = getattr(cp, 'et', 'On time')
+                    expected_time_dt = rebuild_date(time_base, et_str)
+
+                    cp_data = {
+                        "name": getattr(cp, 'locationName', 'Unknown'),
+                        "crs": getattr(cp, 'crs', None),
+                        "scheduled_time": rebuild_date(time_base, getattr(cp, 'st', None)),
+                        "expected_time": expected_time_dt if expected_time_dt else et_str,
+                    }
+                    subsequent_points.append(cp_data)
+
+        status["upcoming_stops"] = subsequent_points
+
+        # Current location estimate (last previous stop or next upcoming stop)
+        if previous_points:
+            status["last_station"] = previous_points[-1]["name"]
+            status["last_station_crs"] = previous_points[-1]["crs"]
+        else:
+            status["last_station"] = None
+            status["last_station_crs"] = None
+
+        if subsequent_points:
+            status["next_station"] = subsequent_points[0]["name"]
+            status["next_station_crs"] = subsequent_points[0]["crs"]
+            status["next_station_scheduled"] = subsequent_points[0]["scheduled_time"]
+            status["next_station_expected"] = subsequent_points[0]["expected_time"]
+        else:
+            status["next_station"] = None
+            status["next_station_crs"] = None
+            status["next_station_scheduled"] = None
+            status["next_station_expected"] = None
+
+        return status
+
     async def async_get_data(self):
         """Data refresh function called by the coordinator"""
         if self.client is None: await self.setup_client()
 
         raw_data = None
         try:
-            _LOGGER.info("Requesting departure data for %s", self.station)
+            _LOGGER.debug("Requesting departure data for %s", self.station)
             raw_data = await self.get_raw_departures()
             if raw_data is None:
                 _LOGGER.error("get_raw_departures returned None for %s", self.station)
@@ -460,7 +846,7 @@ class NationalRailClient:
              raise NationalRailClientException("Unknown Error during fetch") from err
 
         try:
-            _LOGGER.info("Processing station schedule for %s", self.station)
+            _LOGGER.debug("Processing station schedule for %s", self.station)
             data = self.process_data(raw_data) # Pass the Zeep object directly
         except Exception as err:
             _LOGGER.exception("Exception whilst processing data: ")

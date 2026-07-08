@@ -25,6 +25,11 @@ from .sensor import NationalRailScheduleCoordinator
 from .stations import STATION_MAP
 
 _LOGGER = logging.getLogger(__name__)
+_CLIENT_LOGGER = logging.getLogger("custom_components.nationalrailuk.client")
+
+# Keep client logs quiet by default; users can still explicitly set DEBUG for this logger.
+if _CLIENT_LOGGER.level == logging.NOTSET:
+    _CLIENT_LOGGER.setLevel(logging.INFO)
 
 # --- Your Migration Function (IF NEEDED) ---
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
@@ -150,6 +155,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # --- Forward Setup to Platforms (e.g., sensor) ---
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # --- Register Services (only once, on first station entry setup) ---
+    if not hass.services.has_service(DOMAIN, "create_temporary_sensor"):
+        from .services import async_setup_services
+        async_setup_services(hass)
+        _LOGGER.info("National Rail UK services registered")
 
     # Optional: Add update listener if needed for options flow, etc.
     entry.async_on_unload(entry.add_update_listener(update_listener))
