@@ -65,6 +65,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up National Rail UK from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
+    # Optional physical-position enrichment from the Network Rail Window App.
+    # Failure or absence must never block the existing Darwin/RTT integration.
+    from .td_bridge import async_setup_td_bridge
+    await async_setup_td_bridge(hass)
+
     # --- Handle Token-Only Entry (Validation) ---
     # If it's just a token entry, validate it and we're done with *this specific entry*.
     # Another entry will handle the station.

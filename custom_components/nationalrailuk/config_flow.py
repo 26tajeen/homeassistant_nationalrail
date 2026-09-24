@@ -26,7 +26,22 @@ from .const import (
     CONF_TARGET_DESTINATION,
     CONF_TIME_WINDOW_MINUTES,
     CONF_MONITORED_TRAIN_NAME,
-    DEFAULT_TIME_WINDOW
+    CONF_EARLIER_TOLERANCE_MINUTES,
+    CONF_LATER_TOLERANCE_MINUTES,
+    CONF_SELECTION_STRATEGY,
+    CONF_LATCH_MINUTES,
+    CONF_SWITCH_POLICY,
+    CONF_SWITCH_ADVANTAGE_MINUTES,
+    CONF_DELAY_REEVALUATION_MINUTES,
+    DEFAULT_TIME_WINDOW,
+    DEFAULT_EARLIER_TOLERANCE,
+    DEFAULT_SELECTION_STRATEGY,
+    DEFAULT_LATCH_MINUTES,
+    DEFAULT_SWITCH_POLICY,
+    DEFAULT_SWITCH_ADVANTAGE_MINUTES,
+    DEFAULT_DELAY_REEVALUATION_MINUTES,
+    SELECTION_STRATEGIES,
+    SWITCH_POLICIES,
 )
 from .stations import STATIONS, STATION_MAP
 
@@ -470,8 +485,26 @@ class NationalRailConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema({
             vol.Required(CONF_TARGET_TIME, default=current_values.get(CONF_TARGET_TIME)): selector.TimeSelector(),
             vol.Required(CONF_TARGET_DESTINATION, default=current_values.get(CONF_TARGET_DESTINATION)): vol.In(station_options),
-            vol.Optional(CONF_TIME_WINDOW_MINUTES, default=current_values.get(CONF_TIME_WINDOW_MINUTES, DEFAULT_TIME_WINDOW)): selector.NumberSelector(
-                selector.NumberSelectorConfig(min=5, max=60, step=5, unit_of_measurement="minutes")
+            vol.Optional(CONF_EARLIER_TOLERANCE_MINUTES, default=current_values.get(CONF_EARLIER_TOLERANCE_MINUTES, DEFAULT_EARLIER_TOLERANCE)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0, max=60, step=5, unit_of_measurement="minutes")
+            ),
+            vol.Optional(CONF_LATER_TOLERANCE_MINUTES, default=current_values.get(CONF_LATER_TOLERANCE_MINUTES, current_values.get(CONF_TIME_WINDOW_MINUTES, DEFAULT_TIME_WINDOW))): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=5, max=120, step=5, unit_of_measurement="minutes")
+            ),
+            vol.Optional(CONF_SELECTION_STRATEGY, default=current_values.get(CONF_SELECTION_STRATEGY, DEFAULT_SELECTION_STRATEGY)): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=[{"value": value, "label": label} for value, label in SELECTION_STRATEGIES.items()])
+            ),
+            vol.Optional(CONF_LATCH_MINUTES, default=current_values.get(CONF_LATCH_MINUTES, DEFAULT_LATCH_MINUTES)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0, max=60, step=5, unit_of_measurement="minutes")
+            ),
+            vol.Optional(CONF_SWITCH_POLICY, default=current_values.get(CONF_SWITCH_POLICY, DEFAULT_SWITCH_POLICY)): selector.SelectSelector(
+                selector.SelectSelectorConfig(options=[{"value": value, "label": label} for value, label in SWITCH_POLICIES.items()])
+            ),
+            vol.Optional(CONF_SWITCH_ADVANTAGE_MINUTES, default=current_values.get(CONF_SWITCH_ADVANTAGE_MINUTES, DEFAULT_SWITCH_ADVANTAGE_MINUTES)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0, max=30, step=1, unit_of_measurement="minutes")
+            ),
+            vol.Optional(CONF_DELAY_REEVALUATION_MINUTES, default=current_values.get(CONF_DELAY_REEVALUATION_MINUTES, DEFAULT_DELAY_REEVALUATION_MINUTES)): selector.NumberSelector(
+                selector.NumberSelectorConfig(min=0, max=60, step=5, unit_of_measurement="minutes")
             ),
             vol.Optional(CONF_MONITORED_TRAIN_NAME, default=current_values.get(CONF_MONITORED_TRAIN_NAME, "")): cv.string,
         })
@@ -607,8 +640,26 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 # Cannot change target station or toggle monitor here
                 vol.Optional(CONF_TARGET_TIME, default=self._entry_data.get(CONF_TARGET_TIME)): selector.TimeSelector(),
                 vol.Optional(CONF_TARGET_DESTINATION, default=self._entry_data.get(CONF_TARGET_DESTINATION)): vol.In(station_options),
-                vol.Optional(CONF_TIME_WINDOW_MINUTES, default=self._entry_data.get(CONF_TIME_WINDOW_MINUTES, DEFAULT_TIME_WINDOW)): selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=5, max=60, step=5, unit_of_measurement="minutes")
+                vol.Optional(CONF_EARLIER_TOLERANCE_MINUTES, default=self._entry_data.get(CONF_EARLIER_TOLERANCE_MINUTES, DEFAULT_EARLIER_TOLERANCE)): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=60, step=5, unit_of_measurement="minutes")
+                ),
+                vol.Optional(CONF_LATER_TOLERANCE_MINUTES, default=self._entry_data.get(CONF_LATER_TOLERANCE_MINUTES, self._entry_data.get(CONF_TIME_WINDOW_MINUTES, DEFAULT_TIME_WINDOW))): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=5, max=120, step=5, unit_of_measurement="minutes")
+                ),
+                vol.Optional(CONF_SELECTION_STRATEGY, default=self._entry_data.get(CONF_SELECTION_STRATEGY, DEFAULT_SELECTION_STRATEGY)): selector.SelectSelector(
+                    selector.SelectSelectorConfig(options=[{"value": value, "label": label} for value, label in SELECTION_STRATEGIES.items()])
+                ),
+                vol.Optional(CONF_LATCH_MINUTES, default=self._entry_data.get(CONF_LATCH_MINUTES, DEFAULT_LATCH_MINUTES)): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=60, step=5, unit_of_measurement="minutes")
+                ),
+                vol.Optional(CONF_SWITCH_POLICY, default=self._entry_data.get(CONF_SWITCH_POLICY, DEFAULT_SWITCH_POLICY)): selector.SelectSelector(
+                    selector.SelectSelectorConfig(options=[{"value": value, "label": label} for value, label in SWITCH_POLICIES.items()])
+                ),
+                vol.Optional(CONF_SWITCH_ADVANTAGE_MINUTES, default=self._entry_data.get(CONF_SWITCH_ADVANTAGE_MINUTES, DEFAULT_SWITCH_ADVANTAGE_MINUTES)): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=30, step=1, unit_of_measurement="minutes")
+                ),
+                vol.Optional(CONF_DELAY_REEVALUATION_MINUTES, default=self._entry_data.get(CONF_DELAY_REEVALUATION_MINUTES, DEFAULT_DELAY_REEVALUATION_MINUTES)): selector.NumberSelector(
+                    selector.NumberSelectorConfig(min=0, max=60, step=5, unit_of_measurement="minutes")
                 ),
                 vol.Optional(CONF_MONITORED_TRAIN_NAME, default=self._entry_data.get(CONF_MONITORED_TRAIN_NAME, "")): cv.string,
                 vol.Optional(CONF_RTT_TOKEN, default=self._entry_data.get(CONF_RTT_TOKEN, "")): cv.string,

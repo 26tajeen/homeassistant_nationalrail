@@ -35,7 +35,13 @@ from .const import (
     CONF_TARGET_DESTINATION,
     CONF_TIME_WINDOW_MINUTES,
     CONF_MONITORED_TRAIN_NAME,
-    DEFAULT_TIME_WINDOW
+    CONF_EARLIER_TOLERANCE_MINUTES, CONF_LATER_TOLERANCE_MINUTES,
+    CONF_SELECTION_STRATEGY, CONF_LATCH_MINUTES, CONF_SWITCH_POLICY,
+    CONF_SWITCH_ADVANTAGE_MINUTES, CONF_DELAY_REEVALUATION_MINUTES,
+    DEFAULT_TIME_WINDOW, DEFAULT_EARLIER_TOLERANCE,
+    DEFAULT_SELECTION_STRATEGY, DEFAULT_LATCH_MINUTES,
+    DEFAULT_SWITCH_POLICY, DEFAULT_SWITCH_ADVANTAGE_MINUTES,
+    DEFAULT_DELAY_REEVALUATION_MINUTES,
 )
 from .stations import STATION_MAP
 
@@ -44,7 +50,7 @@ from .rtt_client import RTTClient
 
 _LOGGER = logging.getLogger(__name__)
 # <<< CHANGE 1: Update Version >>>
-COMPONENT_VERSION = "VER_26_EXTRA_FIELDS"
+COMPONENT_VERSION = "1.2.0_JOURNEY_POLICY"
 _LOGGER.info("NationalRailUK Sensor Platform Code - %s - Loaded", COMPONENT_VERSION)
 # Consolidated error states from coordinator and monitored sensor
 ERROR_STATES = [
@@ -644,7 +650,16 @@ async def async_setup_entry(
                         coordinator,
                         target_time,
                         target_destination.upper(),
-                        timedelta(minutes=float(time_window))
+                        timedelta(minutes=float(time_window)),
+                        journey_policy={
+                            "earlier_minutes": float(entry.data.get(CONF_EARLIER_TOLERANCE_MINUTES, DEFAULT_EARLIER_TOLERANCE)),
+                            "later_minutes": float(entry.data.get(CONF_LATER_TOLERANCE_MINUTES, time_window)),
+                            "selection_strategy": entry.data.get(CONF_SELECTION_STRATEGY, DEFAULT_SELECTION_STRATEGY),
+                            "latch_minutes": float(entry.data.get(CONF_LATCH_MINUTES, DEFAULT_LATCH_MINUTES)),
+                            "switch_policy": entry.data.get(CONF_SWITCH_POLICY, DEFAULT_SWITCH_POLICY),
+                            "switch_advantage_minutes": float(entry.data.get(CONF_SWITCH_ADVANTAGE_MINUTES, DEFAULT_SWITCH_ADVANTAGE_MINUTES)),
+                            "delay_reevaluation_minutes": float(entry.data.get(CONF_DELAY_REEVALUATION_MINUTES, DEFAULT_DELAY_REEVALUATION_MINUTES)),
+                        },
                     )
                     entities_to_add.append(monitored_train)
                     _LOGGER.debug("SENSOR: Created MonitoredTrainSensor entity '%s'", name)
@@ -807,7 +822,8 @@ class MonitoredTrainSensor(SensorEntity):
         coordinator: NationalRailScheduleCoordinator,
         target_time: time,
         target_destination: str, # Expecting upper case code
-        time_window: timedelta
+        time_window: timedelta,
+        journey_policy: dict | None = None,
     ):
         """Initialize the sensor."""
         # ... (Init remains the same, including version number update) ...
@@ -816,6 +832,19 @@ class MonitoredTrainSensor(SensorEntity):
         self._target_time = target_time
         self._target_destination = target_destination
         self._time_window = time_window
+        policy = journey_policy or {}
+        self._earlier_tolerance = timedelta(minutes=policy.get("earlier_minutes", DEFAULT_EARLIER_TOLERANCE))
+        self._later_tolerance = timedelta(minutes=policy.get("later_minutes", time_window.total_seconds() / 60))
+        self._selection_strategy = policy.get("selection_strategy", DEFAULT_SELECTION_STRATEGY)
+        self._latch_window = timedelta(minutes=policy.get("latch_minutes", DEFAULT_LATCH_MINUTES))
+        self._switch_policy = policy.get("switch_policy", DEFAULT_SWITCH_POLICY)
+        self._switch_advantage = timedelta(minutes=policy.get("switch_advantage_minutes", DEFAULT_SWITCH_ADVANTAGE_MINUTES))
+        self._delay_reevaluation = timedelta(minutes=policy.get("delay_reevaluation_minutes", DEFAULT_DELAY_REEVALUATION_MINUTES))
+        self._latched_at: datetime | None = None
+        self._selection_reason: str | None = None
+        self._previous_service_id: str | None = None
+        self._switch_reason: str | None = None
+        self._alternatives_considered: int = 0
         self._initialized = False
         self._tracked_train_id = None
         self._tracking_stopped = False
@@ -837,6 +866,7 @@ class MonitoredTrainSensor(SensorEntity):
         self._origin_crs: str = coordinator.station  # Store origin station for arrival board polling
         self._destination_crs: str | None = None  # Store destination CRS code when train is captured
         self._tracked_uid: str | None = None  # RealTimeTrains UID for this train
+        self._last_enroute_event_signature: tuple | None = None
 
         # --- Naming and ID ---
         self._attr_name = name
@@ -865,6 +895,12 @@ class MonitoredTrainSensor(SensorEntity):
             "target_destination_name": STATION_MAP.get(target_destination, target_destination),
             "target_departure_time": target_time.strftime("%H:%M:%S"),
             "monitoring_window_minutes": round(time_window.total_seconds() / 60, 1),
+            "search_earlier_minutes": round(self._earlier_tolerance.total_seconds() / 60, 1),
+            "search_later_minutes": round(self._later_tolerance.total_seconds() / 60, 1),
+            "selection_strategy": self._selection_strategy,
+            "switch_policy": self._switch_policy,
+            "latch_minutes_before_departure": round(self._latch_window.total_seconds() / 60, 1),
+            "latched": False,
             "status": "Initializing",
             "last_update_trigger": None,
             "last_update_time": None,
@@ -1040,8 +1076,8 @@ class MonitoredTrainSensor(SensorEntity):
             if not isinstance(self._time_window, timedelta):
                  _LOGGER.error("%s: _time_window is not a timedelta! Cannot calculate window.", entity_id_log)
                  return None, None
-            window_start = target_dt_base
-            window_end = target_dt_base + self._time_window
+            window_start = target_dt_base - self._earlier_tolerance
+            window_end = target_dt_base + self._later_tolerance
         except Exception as time_calc_err:
             _LOGGER.exception("%s: Error during time calculation in _find_best_usable_train: %s", entity_id_log, time_calc_err)
             return None, None
@@ -1090,6 +1126,10 @@ class MonitoredTrainSensor(SensorEntity):
                      #               entity_id_log, i, current_train_id, effective_departure_dt.strftime('%H:%M'),
                      #               window_start.strftime('%H:%M'), window_end.strftime('%H:%M')) # DEBUG -> verbose
                      continue
+                # Never newly latch onto a service that has already left. A small
+                # grace period accommodates slightly late Darwin board updates.
+                if effective_departure_dt < (now - timedelta(minutes=2)):
+                    continue
 
                 expected_arrival_dt = self._calculate_arrival_time(train)
                 if expected_arrival_dt is None:
@@ -1118,7 +1158,29 @@ class MonitoredTrainSensor(SensorEntity):
                             f" excluding ID {exclude_train_id}" if exclude_train_id else "")
             return None, None
 
-        candidate_trains.sort() # Sort by arrival, then duration, then departure
+        self._alternatives_considered = len(candidate_trains)
+        if self._selection_strategy == "closest_to_usual":
+            candidate_trains.sort(
+                key=lambda item: (
+                    abs((item[2] - target_dt_base).total_seconds()),
+                    item[0],
+                    item[1],
+                )
+            )
+            self._selection_reason = "Closest departure to usual time"
+        elif self._selection_strategy == "first_after_usual":
+            after = [item for item in candidate_trains if item[2] >= target_dt_base]
+            if after:
+                candidate_trains = sorted(after, key=lambda item: (item[2], item[0], item[1]))
+            else:
+                candidate_trains.sort(key=lambda item: (-item[2].timestamp(), item[0], item[1]))
+            self._selection_reason = (
+                "First departure at or after usual time"
+                if after else "No later train; closest earlier candidate used"
+            )
+        else:
+            candidate_trains.sort(key=lambda item: (item[0], item[1], item[2]))
+            self._selection_reason = "Earliest predicted arrival"
 
         best_arrival_dt, _, best_dep_time, best_train_data = candidate_trains[0]
         best_sched = best_train_data.get('scheduled')
@@ -1194,7 +1256,7 @@ class MonitoredTrainSensor(SensorEntity):
             if not date:
                 date = update_time.strftime("%Y-%m-%d")
 
-            service = await RTTClient(token).get_service(identity, date)
+            service = await RTTClient(token, self.hass).get_service(identity, date)
             if not service:
                 _LOGGER.debug("%s: RTT returned no service for %s", entity_id_log, rtt_ref)
                 return None
@@ -1347,6 +1409,60 @@ class MonitoredTrainSensor(SensorEntity):
         listeners = []
 
         @callback
+        def td_observation_listener(event: Event) -> None:
+            """Merge an optional App observation into this tracked train."""
+            payload = event.data
+            schedule_uid = str(payload.get("schedule_uid") or "")
+            tracked_uid = str(self._tracked_uid or "")
+            if not schedule_uid or not tracked_uid.startswith(f"{schedule_uid}:"):
+                return
+
+            attrs = dict(self._attr_extra_state_attributes or {})
+            details = dict(attrs.get("tracked_train_details") or {})
+            details.update({
+                "headcode": payload.get("headcode") or payload.get("describer"),
+                "schedule_uid": schedule_uid,
+                "td_area": payload.get("area_id"),
+                "td_from_berth": payload.get("from_berth"),
+                "td_to_berth": payload.get("to_berth"),
+                "td_last_seen_ms": payload.get("timestamp_ms"),
+                "physical_status": (
+                    "outside_window"
+                    if payload.get("candidate_window_corridor")
+                    else "moving_in_york_area"
+                ),
+                "direction": payload.get("direction"),
+                "vehicle_type": payload.get("vehicle_type"),
+                "power_type": payload.get("power_type"),
+                "timing_load": payload.get("timing_load"),
+                "maximum_speed_mph": payload.get("maximum_speed_mph"),
+                "schedule_origin": payload.get("origin"),
+                "schedule_destination": payload.get("destination"),
+                "schedule_calling_points": payload.get("locations"),
+            })
+            attrs["tracked_train_details"] = details
+            attrs["last_update_trigger"] = "Network Rail TD berth observation"
+            self._attr_extra_state_attributes = attrs
+            self.async_write_ha_state()
+
+            self.hass.bus.async_fire(
+                f"{DOMAIN}_train_enroute_update",
+                {
+                    "entity_id": self.entity_id,
+                    "service_id": self._tracked_train_id,
+                    "rtt_uid": self._tracked_uid,
+                    **details,
+                },
+            )
+            _LOGGER.info(
+                "%s: matched TD observation %s %s -> %s",
+                self.entity_id or self._attr_name,
+                details.get("headcode"),
+                details.get("td_from_berth"),
+                details.get("td_to_berth"),
+            )
+
+        @callback
         def source_state_listener(event: Event) -> None:
             """Handle state changes on the source sensor."""
             entity_id = event.data.get("entity_id")
@@ -1428,6 +1544,11 @@ class MonitoredTrainSensor(SensorEntity):
                 self.hass.async_create_task(self.async_update())
 
         try:
+            listeners.append(
+                self.hass.bus.async_listen(
+                    f"{DOMAIN}_td_observation", td_observation_listener
+                )
+            )
             listeners.append(
                 async_track_state_change_event(
                     self.hass, [self._source_sensor_id], source_state_listener
@@ -1541,6 +1662,11 @@ class MonitoredTrainSensor(SensorEntity):
         self._tracked_train_id = None
         self._initialized = False # Crucial to trigger the initial find logic
         self._re_evaluation_performed = False
+        self._latched_at = None
+        self._selection_reason = None
+        self._previous_service_id = None
+        self._switch_reason = None
+        self._alternatives_considered = 0
         self._tracking_stopped_at = None
         self._tracked_scheduled_departure_dt = None
         self._tracked_arrival_dt = None
@@ -1573,7 +1699,32 @@ class MonitoredTrainSensor(SensorEntity):
         new_attrs.setdefault("target_destination_name", STATION_MAP.get(self._target_destination, self._target_destination))
         new_attrs.setdefault("target_departure_time", self._target_time.strftime("%H:%M:%S"))
         new_attrs.setdefault("monitoring_window_minutes", round(self._time_window.total_seconds() / 60, 1))
+        new_attrs.setdefault("search_earlier_minutes", round(self._earlier_tolerance.total_seconds() / 60, 1))
+        new_attrs.setdefault("search_later_minutes", round(self._later_tolerance.total_seconds() / 60, 1))
+        new_attrs.setdefault("selection_strategy", self._selection_strategy)
+        new_attrs["selection_reason"] = self._selection_reason
+        new_attrs["alternatives_considered"] = self._alternatives_considered
+        new_attrs.setdefault("switch_policy", self._switch_policy)
+        new_attrs["switch_reason"] = self._switch_reason
+        new_attrs["previous_service"] = self._previous_service_id
+        new_attrs.setdefault("latch_minutes_before_departure", round(self._latch_window.total_seconds() / 60, 1))
+        new_attrs["latched"] = self._latched_at is not None
+        new_attrs["latched_at"] = self._latched_at.isoformat() if self._latched_at else None
         new_attrs.setdefault("version", COMPONENT_VERSION)
+        new_attrs["selected_service"] = self._tracked_train_id
+        scheduled_difference = None
+        if self._tracked_scheduled_departure_dt:
+            scheduled_minutes = (
+                self._tracked_scheduled_departure_dt.hour * 60
+                + self._tracked_scheduled_departure_dt.minute
+            )
+            target_minutes = self._target_time.hour * 60 + self._target_time.minute
+            scheduled_difference = scheduled_minutes - target_minutes
+            if scheduled_difference > 720:
+                scheduled_difference -= 1440
+            elif scheduled_difference < -720:
+                scheduled_difference += 1440
+        new_attrs["scheduled_difference_minutes"] = scheduled_difference
         new_attrs["last_update_time"] = dt_util.now().isoformat(timespec='milliseconds') # Always update time
 
 
@@ -1593,6 +1744,52 @@ class MonitoredTrainSensor(SensorEntity):
              # _LOGGER.debug("%s: No significant state/attribute change or force_write=False. Skipping HA write.", entity_id_log) # DEBUG -> verbose
              # Still update previous_attributes if nothing changed to keep it in sync
              # self._previous_attributes = new_attrs.copy() # No, only update previous if written
+
+    def _fire_enroute_update(
+        self,
+        attrs: dict,
+        tracking_method: str,
+        position: dict | None = None,
+    ) -> None:
+        """Fire a de-duplicated en-route event for Telegram and other consumers."""
+        details = attrs.get("tracked_train_details") or {}
+        position = position or {}
+        payload = {
+            "entity_id": self.entity_id,
+            "service_id": self._tracked_train_id,
+            "rtt_uid": details.get("rtt_uid") or self._tracked_uid,
+            "operator": details.get("operator_name"),
+            "origin_crs": self._origin_crs,
+            "destination_crs": self._destination_crs,
+            "expected_arrival": details.get("expected_arrival_time"),
+            "platform": details.get("platform"),
+            "is_cancelled": attrs.get("status") == "Cancelled",
+            "cancel_reason": details.get("cancel_reason"),
+            "delay_reason": details.get("delay_reason"),
+            "last_station": position.get("last_station"),
+            "next_station": position.get("next_station"),
+            "next_station_expected": position.get("next_station_time"),
+            "tracking_method": tracking_method,
+        }
+        signature = tuple(
+            payload.get(key)
+            for key in (
+                "service_id", "expected_arrival", "platform", "is_cancelled",
+                "last_station", "next_station", "next_station_expected",
+            )
+        )
+        if signature == self._last_enroute_event_signature:
+            return
+        self._last_enroute_event_signature = signature
+        self.hass.bus.async_fire(f"{DOMAIN}_train_enroute_update", payload)
+        _LOGGER.info(
+            "%s: Fired en-route update (%s): last=%s next=%s ETA=%s",
+            self.entity_id or self._attr_name,
+            tracking_method,
+            payload.get("last_station"),
+            payload.get("next_station"),
+            payload.get("expected_arrival"),
+        )
 
     async def async_update(self) -> None:
         """Fetch new state data for the sensor based on coordinator data."""
@@ -1727,6 +1924,7 @@ class MonitoredTrainSensor(SensorEntity):
                             self._tracking_stopped_at = update_start_time
                             self._coordinator.request_high_frequency_polling(enable=False)
                             self._update_state_and_attrs(new_value, new_attrs, force_write=True)
+                            self._fire_enroute_update(new_attrs, "rtt", rtt_position)
                             return
 
                         has_arrived = False
@@ -1758,6 +1956,7 @@ class MonitoredTrainSensor(SensorEntity):
                             self._tracking_stopped_at = update_start_time
                             self._coordinator.request_high_frequency_polling(enable=False)
                             self._update_state_and_attrs(new_value, new_attrs, force_write=True)
+                            self._fire_enroute_update(new_attrs, "rtt", rtt_position)
                             return
 
                         new_value = "En Route"
@@ -1792,6 +1991,7 @@ class MonitoredTrainSensor(SensorEntity):
                         new_attrs["info"] = " | ".join(info_parts)
                         self._last_enroute_check = update_start_time
                         self._update_state_and_attrs(new_value, new_attrs, force_write=True)
+                        self._fire_enroute_update(new_attrs, "rtt", rtt_position)
                         return
 
                     _LOGGER.info(
@@ -1902,6 +2102,7 @@ class MonitoredTrainSensor(SensorEntity):
                             info_parts.append(f"Delayed: {delay_reason}")
                         new_attrs["info"] = " | ".join(info_parts)
                         self._update_state_and_attrs(new_value, new_attrs, force_write=True)
+                        self._fire_enroute_update(new_attrs, "arrival_board")
                         return
 
                     self._enroute_failure_count += 1
@@ -2024,9 +2225,9 @@ class MonitoredTrainSensor(SensorEntity):
 
 
             # --- Constants for Re-evaluation ---
-            REEVALUATION_WINDOW = timedelta(minutes=10)
-            REEVALUATION_BETTER_THRESHOLD = timedelta(minutes=3)
-            REEVALUATION_DELAY_THRESHOLD = timedelta(minutes=10)
+            REEVALUATION_WINDOW = self._latch_window
+            REEVALUATION_BETTER_THRESHOLD = self._switch_advantage
+            REEVALUATION_DELAY_THRESHOLD = self._delay_reevaluation
 
             # ==============================================================
             # --- Core Logic: Initialization, Re-evaluation, or Tracking ---
@@ -2084,6 +2285,11 @@ class MonitoredTrainSensor(SensorEntity):
                         self._tracked_scheduled_departure_dt = self._parse_train_time(sched_str)
                         self._tracked_arrival_dt = initial_arrival_dt
                         self._re_evaluation_performed = False
+                        self._latched_at = None
+                        self._selection_reason = None
+                        self._previous_service_id = None
+                        self._switch_reason = None
+                        self._alternatives_considered = 0
                         new_attrs["re_evaluation_status"] = "Pending"
                         train_id_for_event = self._tracked_train_id
 
@@ -2133,7 +2339,7 @@ class MonitoredTrainSensor(SensorEntity):
                                             operator_code or "unknown", terminus)
 
                                 if rtt_token:
-                                    self._tracked_uid = await RTTClient(rtt_token).resolve_identity(
+                                    self._tracked_uid = await RTTClient(rtt_token, self.hass).resolve_identity(
                                         self._origin_crs,
                                         rtt_destination_crs,
                                         self._tracked_scheduled_departure_dt,
@@ -2212,11 +2418,16 @@ class MonitoredTrainSensor(SensorEntity):
                                 delay_threshold_met = current_delay >= REEVALUATION_DELAY_THRESHOLD
 
                                 if time_window_reached:
-                                    trigger_reevaluation = True
+                                    self._latched_at = self._latched_at or update_start_time
+                                    trigger_reevaluation = self._switch_policy != "stick_until_cancelled"
                                     reevaluation_reason = f"Departure window reached ({REEVALUATION_WINDOW.seconds // 60} min prior)"
                                 elif delay_threshold_met:
-                                    trigger_reevaluation = True
+                                    trigger_reevaluation = self._switch_policy != "stick_until_cancelled"
                                     reevaluation_reason = f"Delay threshold met ({int(current_delay.total_seconds() / 60)} min)"
+
+                                if self._switch_policy == "stick_until_cancelled" and (time_window_reached or delay_threshold_met):
+                                    self._re_evaluation_performed = True
+                                    new_attrs["re_evaluation_status"] = "Latched; switching disabled"
 
                             if trigger_reevaluation:
                                 _LOGGER.info("%s: Re-evaluation triggered for train %s. Reason: %s.",
@@ -2232,7 +2443,13 @@ class MonitoredTrainSensor(SensorEntity):
                                     if not current_tracked_arrival: # If we couldn't calculate arrival before, try again now
                                          current_tracked_arrival = self._calculate_arrival_time(found_tracked_train)
 
-                                    if current_tracked_arrival and alt_arrival_dt < (current_tracked_arrival - REEVALUATION_BETTER_THRESHOLD):
+                                    should_switch = False
+                                    if self._switch_policy == "next_viable":
+                                        should_switch = True
+                                    elif current_tracked_arrival and alt_arrival_dt < (current_tracked_arrival - REEVALUATION_BETTER_THRESHOLD):
+                                        should_switch = True
+
+                                    if should_switch:
                                         switched_train = True
                                         old_train_id = self._tracked_train_id
                                         old_sched_dt = self._tracked_scheduled_departure_dt
@@ -2288,6 +2505,10 @@ class MonitoredTrainSensor(SensorEntity):
                                         self._tracked_scheduled_departure_dt = self._parse_train_time(new_sched_str)
                                         self._tracked_arrival_dt = alt_arrival_dt # Store new arrival
                                         self._re_evaluation_performed = True # Mark as done for NEW train
+                                        self._latched_at = self._latched_at or update_start_time
+                                        self._previous_service_id = old_train_id
+                                        self._switch_reason = reevaluation_reason
+                                        self._selection_reason = f"Switched under {self._switch_policy} policy"
                                         train_id_for_event = self._tracked_train_id
 
                                         _LOGGER.info("%s:   New Train: %s (Sched: %s, Est Arrival: %s)", entity_id_log, self._tracked_train_id,
@@ -2676,6 +2897,11 @@ class MonitoredTrainSensor(SensorEntity):
                          self._tracked_train_id = None
                          self._initialized = False
                          self._re_evaluation_performed = False
+                         self._latched_at = None
+                         self._selection_reason = None
+                         self._previous_service_id = None
+                         self._switch_reason = None
+                         self._alternatives_considered = 0
                          self._tracking_stopped_at = None
                          self._tracked_scheduled_departure_dt = None
                          self._tracked_arrival_dt = None

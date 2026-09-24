@@ -23,10 +23,35 @@ CONF_TARGET_TIME = "target_time"
 CONF_TARGET_DESTINATION = "target_destination"
 CONF_TIME_WINDOW_MINUTES = "time_window_minutes"
 CONF_MONITORED_TRAIN_NAME = "monitored_train_name"
+CONF_EARLIER_TOLERANCE_MINUTES = "earlier_tolerance_minutes"
+CONF_LATER_TOLERANCE_MINUTES = "later_tolerance_minutes"
+CONF_SELECTION_STRATEGY = "selection_strategy"
+CONF_LATCH_MINUTES = "latch_minutes_before_departure"
+CONF_SWITCH_POLICY = "switch_policy"
+CONF_SWITCH_ADVANTAGE_MINUTES = "switch_advantage_minutes"
+CONF_DELAY_REEVALUATION_MINUTES = "delay_reevaluation_minutes"
 
 
 # Default values
 DEFAULT_TIME_WINDOW = 30
+DEFAULT_EARLIER_TOLERANCE = 0
+DEFAULT_SELECTION_STRATEGY = "earliest_arrival"
+DEFAULT_LATCH_MINUTES = 10
+DEFAULT_SWITCH_POLICY = "better_arrival"
+DEFAULT_SWITCH_ADVANTAGE_MINUTES = 3
+DEFAULT_DELAY_REEVALUATION_MINUTES = 10
+
+SELECTION_STRATEGIES = {
+    "closest_to_usual": "Closest to usual departure",
+    "earliest_arrival": "Earliest arrival",
+    "first_after_usual": "First departure after usual time",
+}
+
+SWITCH_POLICIES = {
+    "stick_until_cancelled": "Stay with selected train unless cancelled",
+    "better_arrival": "Switch when another train arrives meaningfully earlier",
+    "next_viable": "Switch to the next viable train when disrupted",
+}
 
 # Refresh frequency for the sensor (in minutes)
 # This controls how often the coordinator fetches new data from the API

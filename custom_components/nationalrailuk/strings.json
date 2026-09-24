@@ -19,8 +19,30 @@
                     "monitor_train": "Also monitor a specific train",
                     "target_time": "Target train time",
                     "target_destination": "Target train destination",
-                    "time_window_minutes": "Time window around target (minutes)",
+                    "earlier_tolerance_minutes": "Search this many minutes before the usual time",
+                    "later_tolerance_minutes": "Search this many minutes after the usual time",
+                    "selection_strategy": "How to choose the initial train",
+                    "latch_minutes_before_departure": "Latch this many minutes before departure",
+                    "switch_policy": "What to do when circumstances change",
+                    "switch_advantage_minutes": "Minimum arrival-time improvement before switching",
+                    "delay_reevaluation_minutes": "Reconsider the train after this much delay",
                     "monitored_train_name": "Custom name for monitored train (optional)"
+                }
+            },
+            "monitor_details": {
+                "title": "Choose how this journey is matched",
+                "description": "Set the usual train and how the integration should choose and latch onto alternatives.",
+                "data": {
+                    "target_time": "Usual departure time",
+                    "target_destination": "Required calling point or destination",
+                    "earlier_tolerance_minutes": "Search this many minutes before the usual time",
+                    "later_tolerance_minutes": "Search this many minutes after the usual time",
+                    "selection_strategy": "How to choose the initial train",
+                    "latch_minutes_before_departure": "Latch this many minutes before departure",
+                    "switch_policy": "What to do when circumstances change",
+                    "switch_advantage_minutes": "Minimum arrival-time improvement before switching",
+                    "delay_reevaluation_minutes": "Reconsider the train after this much delay",
+                    "monitored_train_name": "Custom name (optional)"
                 }
             },
             "api_token": {
@@ -52,7 +74,13 @@
                     "destinations": "Destination stations",
                     "target_time": "Target train time",
                     "target_destination": "Target train destination",
-                    "time_window_minutes": "Time window around target (minutes)",
+                    "earlier_tolerance_minutes": "Search this many minutes before the usual time",
+                    "later_tolerance_minutes": "Search this many minutes after the usual time",
+                    "selection_strategy": "How to choose the initial train",
+                    "latch_minutes_before_departure": "Latch this many minutes before departure",
+                    "switch_policy": "What to do when circumstances change",
+                    "switch_advantage_minutes": "Minimum arrival-time improvement before switching",
+                    "delay_reevaluation_minutes": "Reconsider the train after this much delay",
                     "monitored_train_name": "Custom name for monitored train"
                 }
             }

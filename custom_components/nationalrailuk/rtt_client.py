@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from homeassistant.helpers.httpx_client import get_async_client
+
 _LOGGER = logging.getLogger(__name__)
 
 RTT_BASE = "https://data.rtt.io"
@@ -33,8 +35,9 @@ def _parse_iso(value: str | None) -> datetime | None:
 class RTTClient:
     """Minimal async client for the data.rtt.io API (gb-nr namespace)."""
 
-    def __init__(self, refresh_token: str, namespace: str = "gb-nr") -> None:
+    def __init__(self, refresh_token: str, hass, namespace: str = "gb-nr") -> None:
         self._refresh = refresh_token
+        self._hass = hass
         self._ns = namespace
         self._access: str | None = None
         self._access_expiry: datetime | None = None
@@ -48,6 +51,7 @@ class RTTClient:
         resp = await client.get(
             f"{RTT_BASE}/api/get_access_token",
             headers={"Authorization": f"Bearer {self._refresh}"},
+            timeout=20.0,
         )
         if resp.status_code != 200:
             raise RTTError(f"token exchange failed: HTTP {resp.status_code}")
@@ -66,27 +70,29 @@ class RTTClient:
 
     async def _get(self, path: str, params: dict) -> dict | None:
         """GET a data endpoint, transparently refreshing the token on a 401."""
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        client = get_async_client(self._hass)
+        token = await self._ensure_access(client)
+        resp = await client.get(
+            f"{RTT_BASE}{path}",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=20.0,
+        )
+        if resp.status_code == 401:
+            # Access token may have expired early; force one re-exchange.
+            self._access = None
             token = await self._ensure_access(client)
             resp = await client.get(
                 f"{RTT_BASE}{path}",
                 params=params,
                 headers={"Authorization": f"Bearer {token}"},
+                timeout=20.0,
             )
-            if resp.status_code == 401:
-                # Access token may have expired early; force one re-exchange.
-                self._access = None
-                token = await self._ensure_access(client)
-                resp = await client.get(
-                    f"{RTT_BASE}{path}",
-                    params=params,
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-            if resp.status_code == 204:
-                return None  # valid query, no services found
-            if resp.status_code != 200:
-                raise RTTError(f"{path} returned HTTP {resp.status_code}")
-            return resp.json()
+        if resp.status_code == 204:
+            return None  # valid query, no services found
+        if resp.status_code != 200:
+            raise RTTError(f"{path} returned HTTP {resp.status_code}")
+        return resp.json()
 
     async def resolve_identity(
         self, origin_crs: str, dest_crs: str, scheduled_dt: datetime
